@@ -62,10 +62,9 @@ class Flezen:
 
     DEFAULT_BASE_URL = "https://flezen.com"
     DEFAULT_USER_AGENT = (
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 FlezenPythonSDK/1.0"
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
     )
-
 
     def __init__(
         self,
@@ -76,7 +75,7 @@ class Flezen:
         api_key: Optional[str] = None,
         base_url: str = DEFAULT_BASE_URL,
         session: Optional[requests.Session] = None,
-        timeout: int = 30,
+        timeout: int = 60,
         auto_login: bool = True,
     ):
         """
@@ -102,12 +101,16 @@ class Flezen:
         self.session.headers.update({
             "User-Agent": self.DEFAULT_USER_AGENT,
             "Accept": "application/json, text/html, */*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Referer": "https://flezen.com/",
+            "Origin": "https://flezen.com",
         })
 
         if api_key:
             self.session.headers["X-API-Key"] = api_key
 
         if fz:
+
             self.session.cookies.set("fz", fz, domain=".flezen.com")
             self.session.cookies.set("fz", fz, domain="flezen.com")
         if rt:
@@ -197,19 +200,28 @@ class Flezen:
         if headers:
             req_headers.update(headers)
 
-        try:
-            response = self.session.request(
-                method=method,
-                url=url,
-                params=params,
-                data=data,
-                json=json,
-                headers=req_headers,
-                timeout=self.timeout,
-                allow_redirects=allow_redirects,
-            )
-        except requests.RequestException as e:
-            raise FlezenError(f"HTTP connection error: {e}") from e
+        response = None
+        for attempt in range(2):
+            try:
+                response = self.session.request(
+                    method=method,
+                    url=url,
+                    params=params,
+                    data=data,
+                    json=json,
+                    headers=req_headers,
+                    timeout=self.timeout,
+                    allow_redirects=allow_redirects,
+                )
+                break
+            except (requests.ConnectionError, requests.Timeout) as e:
+                # Stale keep-alive socket or transient connection reset - retry on fresh socket
+                if attempt == 0:
+                    continue
+                raise FlezenError(f"HTTP connection error: {e}") from e
+            except requests.RequestException as e:
+                raise FlezenError(f"HTTP connection error: {e}") from e
+
 
         # Handle unauthorized / redirect to login
         if response.status_code == 401 or (
