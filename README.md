@@ -168,12 +168,28 @@ url = "https://example.com/files/sample_video.mp4"
 file = client.upload_from_url(
     url=url,
     custom_name="my_downloaded_video.mp4",  # Optional, auto-extracted if omitted
-    progress_callback=lambda u, t: print(f"Streaming upload: {u}/{t} bytes")
+    progress_callback=lambda u, t: print(f"Streaming upload: {u}/{t} bytes"),
+    workers=4  # Multi-threaded chunk uploads (default: 4)
 )
 print("Upload Complete! Public Link:", file.public_url)
 ```
 
+### 4. Maximizing Upload Speed (Parallel Workers)
+
+All upload methods (`upload_file`, `upload_bytes`, and `upload_from_url`) support the **`workers`** parameter (default: `4`):
+
+- **In Google Colab / Cloud VPS (1 Gbps+ link)**: Use **`workers=6`** or **`workers=8`** to upload multiple 25 MB chunks in parallel and saturate gigabit bandwidth.
+- **On Fast Home Fiber (100–300 Mbps)**: Use the default **`workers=4`**.
+- **On Standard Home Wi-Fi (25–50 Mbps)**: Use **`workers=2`** or **`workers=3`**.
+- **On Mobile Hotspot (< 20 Mbps)**: Use **`workers=1`** to avoid latency and packet drops.
+
+```python
+# Upload large file at maximum speed in Google Colab
+file = client.upload_file("huge_movie.mkv", workers=8, progress_callback=progress_bar)
+```
+
 ---
+
 
 
 ## Public Links & Android Intent Deep Links

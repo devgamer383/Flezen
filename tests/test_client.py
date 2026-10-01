@@ -409,8 +409,33 @@ class TestFlezenClient(unittest.TestCase):
         self.assertEqual(res.name, "remote_file.pdf")
         client.initiate_upload.assert_called_once_with(name="remote_file.pdf", size=2048, parent_id="")
 
+    def test_parallel_upload_workers(self):
+        client = Flezen(fz="fake_fz", session=self.mock_session, auto_login=False)
+
+        client.initiate_upload = MagicMock(return_value=MagicMock(
+            signature="sig-multi",
+            signed_ids=["t1", "t2", "t3", "t4"],
+            part_size=10,
+            server_url="https://storage-node.flezen.com",
+        ))
+        client.upload_chunk = MagicMock(side_effect=lambda **kw: "jid_" + kw["signed_id"])
+        client.complete_upload = MagicMock(side_effect=lambda signature_id, parts: FlezenFile(
+            name="multi.bin",
+            size=40,
+            slug="multislug",
+        ))
+
+        data = b"0123456789" * 4  # 40 bytes = 4 parts of 10 bytes
+        res = client.upload_bytes(data, filename="multi.bin", workers=4)
+        self.assertEqual(res.slug, "multislug")
+        self.assertEqual(client.upload_chunk.call_count, 4)
+        # Check parts were submitted sorted 1, 2, 3, 4
+        parts_arg = client.complete_upload.call_args[1]["parts"]
+        self.assertEqual([p["number"] for p in parts_arg], [1, 2, 3, 4])
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 

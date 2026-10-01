@@ -3,15 +3,19 @@ Flezen API Python Client
 Official-grade SDK for flezen.com
 """
 
+import concurrent.futures
 import io
 import math
 import os
 import re
+import threading
 from pathlib import Path
 from typing import Any, BinaryIO, Callable, Dict, List, Optional, Union
 from urllib.parse import unquote, urljoin, urlparse
 
 import requests
+from requests.adapters import HTTPAdapter
+
 
 
 from .exceptions import (
@@ -106,7 +110,12 @@ class Flezen:
             "Origin": "https://flezen.com",
         })
 
+        adapter = HTTPAdapter(pool_connections=25, pool_maxsize=25)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
+
         if api_key:
+
             self.session.headers["X-API-Key"] = api_key
 
         if fz:
@@ -467,6 +476,7 @@ class Flezen:
         parent_id: str = "",
         custom_name: Optional[str] = None,
         progress_callback: Optional[Callable[[int, int], None]] = None,
+        workers: int = 4,
     ) -> FlezenFile:
         """
         High-level helper to upload a local file using the 3-step chunked engine.
@@ -475,6 +485,7 @@ class Flezen:
         :param parent_id: Optional parent folder ID.
         :param custom_name: Optional custom filename to store as.
         :param progress_callback: Optional callback fn(uploaded_bytes, total_bytes).
+        :param workers: Number of concurrent chunk upload threads (default: 4).
         :return: FlezenFile metadata.
         """
         path = Path(file_path)
@@ -490,41 +501,67 @@ class Flezen:
         total_parts = max(1, math.ceil(file_size / part_size))
         signed_ids = init_res.signed_ids
 
-        uploaded_parts = []
         bytes_transferred = 0
+        progress_lock = threading.Lock()
 
-        with open(path, "rb") as f:
-            for part_num in range(1, total_parts + 1):
-                chunk = f.read(part_size)
-                if not chunk and part_num > 1:
-                    break
+        def upload_single_part(part_num: int) -> Dict[str, Any]:
+            nonlocal bytes_transferred
+            offset = (part_num - 1) * part_size
+            length = min(part_size, file_size - offset)
 
-                signed_id_index = part_num - 1
-                if signed_id_index < len(signed_ids):
-                    signed_id = signed_ids[signed_id_index]
-                else:
-                    signed_id = signed_ids[-1]
+            with open(path, "rb") as f:
+                f.seek(offset)
+                chunk = f.read(length)
 
-                def on_chunk_bytes(bytes_read: int):
-                    nonlocal bytes_transferred
+            signed_id_index = part_num - 1
+            if signed_id_index < len(signed_ids):
+                signed_id = signed_ids[signed_id_index]
+            else:
+                signed_id = signed_ids[-1]
+
+            part_bytes_read = 0
+
+            def on_chunk_bytes(bytes_read: int):
+                nonlocal bytes_transferred, part_bytes_read
+                with progress_lock:
                     bytes_transferred += bytes_read
+                    part_bytes_read += bytes_read
                     if progress_callback:
                         progress_callback(bytes_transferred, file_size)
 
-                jid = self.upload_chunk(
-                    server_url=init_res.server_url,
-                    signed_id=signed_id,
-                    chunk_data=chunk,
-                    on_progress=on_chunk_bytes if progress_callback else None,
-                )
-                uploaded_parts.append({"number": part_num, "id": jid})
+            jid = self.upload_chunk(
+                server_url=init_res.server_url,
+                signed_id=signed_id,
+                chunk_data=chunk,
+                on_progress=on_chunk_bytes if progress_callback else None,
+            )
 
-                # Ensure bytes_transferred aligns after chunk finishes
-                part_cumulative = min(part_num * part_size, file_size)
-                if bytes_transferred < part_cumulative:
-                    bytes_transferred = part_cumulative
+            unaccounted = len(chunk) - part_bytes_read
+            if unaccounted > 0:
+                with progress_lock:
+                    bytes_transferred += unaccounted
                     if progress_callback:
                         progress_callback(bytes_transferred, file_size)
+
+            return {"number": part_num, "id": jid}
+
+
+        num_workers = min(workers, total_parts) if workers > 1 else 1
+
+        if num_workers <= 1:
+            uploaded_parts = [upload_single_part(p) for p in range(1, total_parts + 1)]
+        else:
+            uploaded_parts = []
+            with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+                futures = {executor.submit(upload_single_part, p): p for p in range(1, total_parts + 1)}
+                for future in concurrent.futures.as_completed(futures):
+                    uploaded_parts.append(future.result())
+
+        # Flezen requires parts sorted in ascending order 1..N
+        uploaded_parts.sort(key=lambda p: p["number"])
+
+        if progress_callback and bytes_transferred < file_size:
+            progress_callback(file_size, file_size)
 
         return self.complete_upload(
             signature_id=init_res.signature,
@@ -537,6 +574,7 @@ class Flezen:
         filename: str,
         parent_id: str = "",
         progress_callback: Optional[Callable[[int, int], None]] = None,
+        workers: int = 4,
     ) -> FlezenFile:
         """
         High-level helper to upload in-memory bytes using the 3-step chunked engine.
@@ -545,6 +583,7 @@ class Flezen:
         :param filename: Filename for the uploaded object.
         :param parent_id: Optional parent folder ID.
         :param progress_callback: Optional callback fn(uploaded_bytes, total_bytes).
+        :param workers: Number of concurrent chunk upload threads (default: 4).
         :return: FlezenFile metadata.
         """
         file_size = len(data)
@@ -554,10 +593,11 @@ class Flezen:
         total_parts = max(1, math.ceil(file_size / part_size))
         signed_ids = init_res.signed_ids
 
-        uploaded_parts = []
         bytes_transferred = 0
+        progress_lock = threading.Lock()
 
-        for part_num in range(1, total_parts + 1):
+        def upload_single_bytes_part(part_num: int) -> Dict[str, Any]:
+            nonlocal bytes_transferred
             start = (part_num - 1) * part_size
             end = min(start + part_size, file_size)
             chunk = data[start:end]
@@ -568,11 +608,15 @@ class Flezen:
             else:
                 signed_id = signed_ids[-1]
 
+            part_bytes_read = 0
+
             def on_chunk_bytes(bytes_read: int):
-                nonlocal bytes_transferred
-                bytes_transferred += bytes_read
-                if progress_callback:
-                    progress_callback(bytes_transferred, file_size)
+                nonlocal bytes_transferred, part_bytes_read
+                with progress_lock:
+                    bytes_transferred += bytes_read
+                    part_bytes_read += bytes_read
+                    if progress_callback:
+                        progress_callback(bytes_transferred, file_size)
 
             jid = self.upload_chunk(
                 server_url=init_res.server_url,
@@ -580,14 +624,32 @@ class Flezen:
                 chunk_data=chunk,
                 on_progress=on_chunk_bytes if progress_callback else None,
             )
-            uploaded_parts.append({"number": part_num, "id": jid})
 
-            part_cumulative = min(part_num * part_size, file_size)
-            if bytes_transferred < part_cumulative:
-                bytes_transferred = part_cumulative
-                if progress_callback:
-                    progress_callback(bytes_transferred, file_size)
+            unaccounted = len(chunk) - part_bytes_read
+            if unaccounted > 0:
+                with progress_lock:
+                    bytes_transferred += unaccounted
+                    if progress_callback:
+                        progress_callback(bytes_transferred, file_size)
 
+            return {"number": part_num, "id": jid}
+
+
+        num_workers = min(workers, total_parts) if workers > 1 else 1
+
+        if num_workers <= 1:
+            uploaded_parts = [upload_single_bytes_part(p) for p in range(1, total_parts + 1)]
+        else:
+            uploaded_parts = []
+            with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+                futures = {executor.submit(upload_single_bytes_part, p): p for p in range(1, total_parts + 1)}
+                for future in concurrent.futures.as_completed(futures):
+                    uploaded_parts.append(future.result())
+
+        uploaded_parts.sort(key=lambda p: p["number"])
+
+        if progress_callback and bytes_transferred < file_size:
+            progress_callback(file_size, file_size)
 
         return self.complete_upload(
             signature_id=init_res.signature,
@@ -601,6 +663,7 @@ class Flezen:
         parent_id: str = "",
         headers: Optional[Dict[str, str]] = None,
         progress_callback: Optional[Callable[[int, int], None]] = None,
+        workers: int = 4,
     ) -> FlezenFile:
         """
         Upload a file directly from a public URL.
@@ -613,6 +676,7 @@ class Flezen:
         :param parent_id: Optional parent folder ID.
         :param headers: Optional HTTP headers for fetching the remote URL.
         :param progress_callback: Optional callback fn(uploaded_bytes, total_bytes).
+        :param workers: Number of concurrent chunk upload threads (default: 4).
         :return: FlezenFile metadata.
         """
         fetch_headers = {
@@ -646,33 +710,26 @@ class Flezen:
             total_parts = max(1, math.ceil(file_size / part_size))
             signed_ids = init_res.signed_ids
 
-            uploaded_parts = []
             bytes_transferred = 0
-            stream_iterator = iter(res.iter_content(chunk_size=65536))
+            progress_lock = threading.Lock()
 
-            for part_num in range(1, total_parts + 1):
-                part_buffer = bytearray()
-                while len(part_buffer) < part_size:
-                    try:
-                        chunk = next(stream_iterator)
-                        if not chunk:
-                            break
-                        part_buffer.extend(chunk)
-                    except StopIteration:
-                        break
-
-                if not part_buffer and part_num > 1:
-                    break
-
-                chunk_bytes = bytes(part_buffer)
+            def upload_remote_part(part_num: int, chunk_bytes: bytes) -> Dict[str, Any]:
+                nonlocal bytes_transferred
                 signed_id_index = part_num - 1
-                signed_id = signed_ids[signed_id_index] if signed_id_index < len(signed_ids) else signed_ids[-1]
+                if signed_id_index < len(signed_ids):
+                    signed_id = signed_ids[signed_id_index]
+                else:
+                    signed_id = signed_ids[-1]
+
+                part_bytes_read = 0
 
                 def on_chunk_bytes(bytes_read: int):
-                    nonlocal bytes_transferred
-                    bytes_transferred += bytes_read
-                    if progress_callback:
-                        progress_callback(bytes_transferred, file_size)
+                    nonlocal bytes_transferred, part_bytes_read
+                    with progress_lock:
+                        bytes_transferred += bytes_read
+                        part_bytes_read += bytes_read
+                        if progress_callback:
+                            progress_callback(bytes_transferred, file_size)
 
                 jid = self.upload_chunk(
                     server_url=init_res.server_url,
@@ -680,13 +737,59 @@ class Flezen:
                     chunk_data=chunk_bytes,
                     on_progress=on_chunk_bytes if progress_callback else None,
                 )
-                uploaded_parts.append({"number": part_num, "id": jid})
 
-                part_cumulative = min(part_num * part_size, file_size)
-                if bytes_transferred < part_cumulative:
-                    bytes_transferred = part_cumulative
-                    if progress_callback:
-                        progress_callback(bytes_transferred, file_size)
+                unaccounted = len(chunk_bytes) - part_bytes_read
+                if unaccounted > 0:
+                    with progress_lock:
+                        bytes_transferred += unaccounted
+                        if progress_callback:
+                            progress_callback(bytes_transferred, file_size)
+
+                return {"number": part_num, "id": jid}
+
+
+            num_workers = min(workers, total_parts) if workers > 1 else 1
+            uploaded_parts = []
+            stream_iterator = iter(res.iter_content(chunk_size=131072))
+
+            if num_workers <= 1:
+                for part_num in range(1, total_parts + 1):
+                    part_buffer = bytearray()
+                    while len(part_buffer) < part_size:
+                        try:
+                            c = next(stream_iterator)
+                            if not c:
+                                break
+                            part_buffer.extend(c)
+                        except StopIteration:
+                            break
+                    if not part_buffer and part_num > 1:
+                        break
+                    uploaded_parts.append(upload_remote_part(part_num, bytes(part_buffer)))
+            else:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=num_workers) as executor:
+                    futures = []
+                    for part_num in range(1, total_parts + 1):
+                        part_buffer = bytearray()
+                        while len(part_buffer) < part_size:
+                            try:
+                                c = next(stream_iterator)
+                                if not c:
+                                    break
+                                part_buffer.extend(c)
+                            except StopIteration:
+                                break
+                        if not part_buffer and part_num > 1:
+                            break
+                        futures.append(executor.submit(upload_remote_part, part_num, bytes(part_buffer)))
+
+                    for f in concurrent.futures.as_completed(futures):
+                        uploaded_parts.append(f.result())
+
+            uploaded_parts.sort(key=lambda p: p["number"])
+
+            if progress_callback and bytes_transferred < file_size:
+                progress_callback(file_size, file_size)
 
             return self.complete_upload(
                 signature_id=init_res.signature,
@@ -697,7 +800,7 @@ class Flezen:
             import tempfile
             with tempfile.NamedTemporaryFile(delete=False) as tmp:
                 temp_path = tmp.name
-                for chunk in res.iter_content(chunk_size=65536):
+                for chunk in res.iter_content(chunk_size=131072):
                     if chunk:
                         tmp.write(chunk)
 
@@ -712,9 +815,11 @@ class Flezen:
                     parent_id=parent_id,
                     custom_name=file_name,
                     progress_callback=progress_callback,
+                    workers=workers,
                 )
             finally:
                 Path(temp_path).unlink(missing_ok=True)
+
 
 
     # =========================================================================
